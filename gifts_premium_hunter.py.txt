@@ -1,0 +1,293 @@
+import asyncio, os, re, json, logging, signal, random
+from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
+from telethon import TelegramClient
+from playwright.async_api import async_playwright, Page, Frame
+
+load_dotenv()
+
+API_ID = int(os.getenv("TG_API_ID"))
+API_HASH = os.getenv("TG_API_HASH")
+SESSION = os.getenv("SESSION_NAME", "user_gifts_session")
+
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))           # секунд между циклами
+MAX_BUYS_PER_CYCLE = int(os.getenv("MAX_BUYS_PER_CYCLE", "5"))    # покупок за цикл
+PREMIUM_WORDS = [w.strip().lower() for w in os.getenv("PREMIUM_WORDS", "premium,премиум").split(",")]
+NEW_NOTIFY_LIMIT = int(os.getenv("NEW_NOTIFY_LIMIT", "20"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+STORAGE = "tg_storage_state.json"     # playwright: состояние сессии Telegram Web
+BOUGHT_FILE = Path("bought_titles.json")
+SEEN_FILE = Path("seen_gifts.json")   # <— все уже встреченные карточки (для уведомлений о новых)
+
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
+                    format="%(asctime)s %(levelname)s: %(message)s")
+LOG = logging.getLogger("gifts")
+
+# ===== Селекторы =====
+ENTRY_SEND_GIFT = "button:has-text('Отправить подарок'), button:has-text('Send a gift')"
+ENTRY_SEND_TO_SELF = "button:has-text('Отправить себе'), button:has-text('Send to myself')"
+
+ALL_TAB = "button:has-text('Все подарки'), button:has-text('All gifts')"
+
+CARD_ITEM = "[data-test-id='gift-card'], .gift-card, [class*='giftCard'], [class*='GiftCard']"
+CARD_TITLE = ".title, [data-test-id='gift-title'], [class*='Title']"
+CARD_BADGE = ".badge, .label, [data-test-id='gift-badge'], [class*='Badge']"
+CARD_FRAME = ".card, .frame, .container, [class*='card']"
+
+BUY_BTN_LIST = ("button:has-text('Купить'), button:has-text('Buy'), "
+                "button:has-text('Отправить'), button:has-text('Send')")
+CONFIRM_BUY_BTN = ("button:has-text('ОТПРАВИТЬ ПОДАРОК'), "
+                   "button:has-text('Отправить подарок'), button:has-text('Send gift')")
+
+GIFT_ENTRY_URL = "https://t.me/gifts"
+
+# ===== Утиль =====
+def _load_set(file: Path) -> set:
+    if file.exists():
+        try:
+            return set(json.loads(file.read_text("utf-8")))
+        except Exception:
+            return set()
+    return set()
+
+def _save_set(file: Path, s: set):
+    file.write_text(json.dumps(sorted(s), ensure_ascii=False), encoding="utf-8")
+
+def load_bought() -> set:
+    return _load_set(BOUGHT_FILE)
+
+def save_bought(s: set):
+    _save_set(BOUGHT_FILE, s)
+
+def load_seen() -> set:
+    return _load_set(SEEN_FILE)
+
+def save_seen(s: set):
+    _save_set(SEEN_FILE, s)
+
+def looks_premium(title:str, badge:str)->bool:
+    t = (title or "").lower()
+    b = (badge or "").lower()
+    return any(w in t for w in PREMIUM_WORDS) or any(w in b for w in PREMIUM_WORDS)
+
+async def has_colored_border(card) -> bool:
+    # Эвристика "цветная обводка": не серые границы/тени
+    try:
+        elem = card.locator(CARD_FRAME).first
+        if await elem.count() == 0:
+            elem = card
+        color = await elem.evaluate("""(el)=>{
+            const s = getComputedStyle(el);
+            return (s.borderColor || s.outlineColor || s.boxShadow || '').toString();
+        }""")
+        if not color:
+            return False
+        color = color.lower()
+        if "transparent" in color or "none" == color.strip():
+            return False
+        m = re.search(r"rgb\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)", color)
+        if m:
+            r,g,b = map(int, m.groups())
+            # true если не серый (r≈g≈b — серый)
+            return not (abs(r-g)<8 and abs(g-b)<8 and abs(r-b)<8)
+        m = re.search(r"#([0-9a-f]{6})", color)
+        if m:
+            hv = m.group(1); r=int(hv[0:2],16); g=int(hv[2:4],16); b=int(hv[4:6],16)
+            return not (abs(r-g)<8 and abs(g-b)<8 and abs(r-b)<8)
+        return "rgba(" in color or "box-shadow" in color or "inset" in color
+    except:
+        return False
+
+# ===== Playwright шаги =====
+async def ensure_login(context):
+    page = await context.new_page()
+    await page.goto("https://web.telegram.org/k/", wait_until="networkidle")
+    if "login" in page.url or "auth" in page.url:
+        LOG.info("Открой браузер и залогинься (QR/код). Скрипт ждёт…")
+        await page.wait_for_url(re.compile(r".*/k/.*"), timeout=0)
+        await context.storage_state(path=STORAGE)
+        LOG.info("Сессия сохранена: %s", STORAGE)
+    else:
+        LOG.info("Найдена активная сессия Telegram Web.")
+    await page.close()
+
+async def open_gifts_webapp(page: Page) -> Frame:
+    await page.goto(GIFT_ENTRY_URL, wait_until="domcontentloaded")
+    # Локализованные кнопки "Open"
+    for text in ("Open", "Открыть"):
+        try:
+            await page.get_by_text(text).click(timeout=2500)
+            break
+        except:
+            pass
+    await page.wait_for_timeout(1200)
+    frames = [f for f in page.frames if f != page.main_frame]
+    return frames[-1] if frames else page.main_frame
+
+async def enter_catalog(webview: Frame):
+    # Шаги: Отправить подарок -> Отправить себе
+    try:
+        if await webview.locator(ENTRY_SEND_GIFT).count():
+            await webview.locator(ENTRY_SEND_GIFT).first.click()
+            await webview.wait_for_timeout(350)
+    except:
+        pass
+    try:
+        if await webview.locator(ENTRY_SEND_TO_SELF).count():
+            await webview.locator(ENTRY_SEND_TO_SELF).first.click()
+            await webview.wait_for_timeout(500)
+    except:
+        pass
+
+async def refresh_app(webview: Frame):
+    try:
+        if await webview.locator(ALL_TAB).count():
+            await webview.locator(ALL_TAB).first.click()
+            await webview.wait_for_timeout(350)
+    except:
+        pass
+
+async def scan_and_buy(webview: Frame, bought_titles:set, seen_gifts:set,
+                       max_buys:int, client: TelegramClient) -> int:
+    """
+    Сканируем каталог:
+      • отправляем уведомления о ЛЮБЫХ новых карточках (seen_gifts)
+      • покупаем премиум до max_buys
+    """
+    buys = 0
+    new_notified = 0
+
+    cards = await webview.locator(CARD_ITEM).all()
+    LOG.info("Карточек на экране: %d", len(cards))
+
+    for card in cards:
+        # заголовок/бейдж — могут отсутствовать
+        title = badge = ""
+        try:
+            if await card.locator(CARD_TITLE).count():
+                title = (await card.locator(CARD_TITLE).first.inner_text()).strip()
+            if await card.locator(CARD_BADGE).count():
+                badge = (await card.locator(CARD_BADGE).first.inner_text()).strip()
+        except:
+            pass
+
+        # устойчивый ключ карточки
+        try:
+            html_snip = await card.evaluate('(e)=>e.outerHTML')
+        except:
+            html_snip = ""
+        key = (title or f"html:{html_snip.strip()[:96]}")
+
+        # ----- уведомление о ЛЮБОМ новом подарке -----
+        if key not in seen_gifts and new_notified < NEW_NOTIFY_LIMIT:
+            try:
+                await client.send_message("me", f"🆕 Новый подарок обнаружен: {title or '(без названия)'}")
+            except Exception as e:
+                LOG.warning("Не отправилось уведомление о новом подарке: %s", e)
+            seen_gifts.add(key); save_seen(seen_gifts)
+            new_notified += 1
+
+        # ----- премиум‑детект и покупка -----
+        is_premium = looks_premium(title, badge)
+        if not is_premium:
+            is_premium = await has_colored_border(card)
+        if not is_premium:
+            continue
+
+        if key in bought_titles:
+            continue
+
+        LOG.info("🔎 Премиум: %r / %r", title, badge)
+
+        # открыть карточку
+        try:
+            await card.click()
+        except Exception as e:
+            LOG.warning("Не кликнулось: %s", e); continue
+
+        # шаг 1: кнопка покупки на карточке
+        try:
+            await webview.locator(BUY_BTN_LIST).first.click(timeout=5000)
+        except Exception as e:
+            LOG.warning("Нет кнопки 'Купить/Отправить' на 1-м экране: %s", e)
+            try: await webview.go_back()
+            except: pass
+            continue
+
+        # шаг 2: подтверждение — 'Отправить подарок'
+        try:
+            btn = webview.locator(CONFIRM_BUY_BTN).first
+            await btn.wait_for(timeout=6000)
+            price_txt = (await btn.inner_text()).strip()
+            await btn.click()
+            LOG.info("✅ Куплено: %s (%s)", key, price_txt)
+            bought_titles.add(key); save_bought(bought_titles)
+            try:
+                await client.send_message("me", f"✅ Куплен подарок: {title or key} {('('+price_txt+')') if price_txt else ''}")
+            except Exception as e:
+                LOG.warning("Не отправилось в 'Избранное': %s", e)
+
+            buys += 1
+            if buys >= max_buys: break
+            await asyncio.sleep(1.0 + random.random()*0.7)
+        except Exception as e:
+            LOG.warning("Не подтвердил покупку: %s", e)
+            try: await webview.go_back()
+            except: pass
+
+    return buys
+
+# ===== Главный цикл =====
+async def worker_loop():
+    bought_titles = load_bought()
+    seen_gifts = load_seen()
+
+    # Telethon — для уведомлений в "Избранное" (user‑сессия)
+    client = TelegramClient(SESSION, API_ID, API_HASH)
+    await client.start()  # первый запуск спросит код/2FA
+
+    async with async_playwright() as p:
+        # флаги для VPS
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        context = await browser.new_context(
+            storage_state=STORAGE if Path(STORAGE).exists() else None
+        )
+        await ensure_login(context)
+
+        while True:
+            page = await context.new_page()
+            try:
+                LOG.info("Открываю мини‑апп…")
+                webview = await open_gifts_webapp(page)
+                await enter_catalog(webview)
+                await refresh_app(webview)
+                bought_now = await scan_and_buy(webview, bought_titles, seen_gifts,
+                                                MAX_BUYS_PER_CYCLE, client)
+                LOG.info("Цикл завершён: куплено %d", bought_now)
+            except Exception as e:
+                LOG.error("Сбой цикла: %s", e)
+            finally:
+                try: await page.close()
+                except: pass
+
+            await asyncio.sleep(CHECK_INTERVAL)
+
+async def main_forever():
+    # перезапуск воркера при любых фатальных сбоях
+    while True:
+        try:
+            await worker_loop()
+        except Exception as e:
+            LOG.error("Worker упал, перезапускаю через 5с: %s", e)
+            await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_DFL)
+    asyncio.run(main_forever())
