@@ -174,6 +174,22 @@ async def scan_and_buy(webview, bought_titles: set, seen_gifts: set,
     new_notified = 0
 
     cards = await webview.locator(CARD_ITEM).all()
+    cards_count = len(cards)
+
+    if cards_count == 0:
+        LOG.warning("⚠️ Карточек на экране = 0 — сохраняю скриншот и HTML для отладки...")
+        await webview.screenshot(path="debug_no_cards.png", full_page=True)
+        html_content = await webview.content()
+        with open("debug_no_cards.html", "w", encoding="utf-8") as f:
+            f.write(html_content)
+        LOG.info("💾 Файлы сохранены: debug_no_cards.png и debug_no_cards.html")
+
+        # Повторная попытка через 3 сек
+        await asyncio.sleep(3)
+        cards = await webview.locator(CARD_ITEM).all()
+        cards_count = len(cards)
+
+    LOG.info("Карточек на экране: %d", cards_count)
 cards_count = len(cards)
 
 if cards_count == 0:
@@ -339,4 +355,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
